@@ -1,0 +1,15 @@
+node_modules/
+.env
+.env.*
+!.env.example
+
+dist/
+build/
+coverage/
+
+*.log
+*.xlsx
+*.xls
+
+.vercel/
+.DS_Store

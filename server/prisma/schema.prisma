@@ -1,0 +1,208 @@
+// RCM Network Management & PV Analysis — database schema
+//
+// Design principles
+// - AB Number (Member.abNumber) is the single identity key for every member.
+// - Sponsor (Member.sponsorId) decides tree position. Proposer (Member.proposerId)
+//   is an independent relationship used for joining analytics.
+// - The Main Leader is an ordinary Member row that is linked to the only User and
+//   has no sponsor. There is no artificial ROOT member.
+// - Excel is an import source only. Report-derived fields live on Member, monthly
+//   PV lives in MonthlyPv, rows for unknown AB numbers wait in UnmappedRecord.
+// - Network statistics and group PV are never stored; they are derived from the
+//   sponsor hierarchy with recursive queries.
+
+generator client {
+  provider               = "prisma-client"
+  output                 = "../src/generated/prisma"
+  moduleFormat           = "esm"
+  importFileExtension    = "js"
+  generatedFileExtension = "ts"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum UserRole {
+  MAIN_LEADER
+}
+
+enum KycStatus {
+  OK
+  NOT_OK
+}
+
+enum MemberStatus {
+  ACTIVE
+  TERMINATED
+}
+
+enum PvSource {
+  EXCEL
+  MANUAL
+}
+
+enum ImportStatus {
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+/// The only login account in this version: the Main Leader.
+/// `role` is unique, so the database itself prevents a second Main Leader.
+model User {
+  id           String    @id @default(cuid())
+  role         UserRole  @unique @default(MAIN_LEADER)
+  memberId     String    @unique
+  member       Member    @relation(fields: [memberId], references: [id], onDelete: Restrict)
+  passwordHash String
+  /// Bumped on password change so older JWTs stop working.
+  tokenVersion Int       @default(0)
+  lastLoginAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+}
+
+model Member {
+  id        String       @id @default(cuid())
+  abNumber  String       @unique
+  name      String
+  kycStatus KycStatus    @default(OK)
+  status    MemberStatus @default(ACTIVE)
+
+  // ---- Network relationships (manually maintained, never touched by Excel) ----
+  sponsorId  String?
+  sponsor    Member?  @relation("Sponsorship", fields: [sponsorId], references: [id], onDelete: Restrict)
+  children   Member[] @relation("Sponsorship")
+  proposerId String?
+  proposer   Member?  @relation("Proposal", fields: [proposerId], references: [id], onDelete: SetNull)
+  proposed   Member[] @relation("Proposal")
+
+  /// Main Leader only: upline sponsor / proposer who are outside this network.
+  externalSponsorAbNumber  String?
+  externalSponsorName      String?
+  externalProposerAbNumber String?
+  externalProposerName     String?
+
+  // ---- Smart Report fields (sourced from Excel, matched by AB Number) ----
+  /// Excel "Feeding Date" — treated as the Joining Date.
+  joiningDate            DateTime? @db.Date
+  mobile                 String?
+  city                   String?
+  district               String?
+  state                  String?
+  /// Excel "Proposer" (AB number) and "Proposer Name" exactly as reported.
+  reportProposerAbNumber String?
+  reportProposerName     String?
+  /// Excel "PUC Home Delivery" (Y/N)
+  pucHomeDelivery        Boolean?
+  /// Excel "Display Wall" (Y/N)
+  displayWall            Boolean?
+  reportUpdatedAt        DateTime?
+  lastImportId           String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user      User?
+  monthlyPv MonthlyPv[]
+  pvAudits  PvAuditLog[]
+
+  @@index([sponsorId])
+  @@index([proposerId])
+  @@index([joiningDate])
+  @@index([reportProposerAbNumber])
+  @@index([name])
+  @@index([status, kycStatus])
+}
+
+/// One Self PV value per member per calendar month. History is never overwritten
+/// by a different month; re-imports / manual updates overwrite the same month.
+model MonthlyPv {
+  id        String   @id @default(cuid())
+  memberId  String
+  member    Member   @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  year      Int
+  month     Int
+  selfPv    Decimal  @db.Decimal(14, 2)
+  source    PvSource
+  importId  String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([memberId, year, month])
+  @@index([year, month, selfPv])
+}
+
+/// Every PV change (Excel or manual) with old and new value.
+model PvAuditLog {
+  id        String   @id @default(cuid())
+  memberId  String
+  member    Member   @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  year      Int
+  month     Int
+  oldPv     Decimal? @db.Decimal(14, 2)
+  newPv     Decimal  @db.Decimal(14, 2)
+  source    PvSource
+  importId  String?
+  createdAt DateTime @default(now())
+
+  @@index([memberId, createdAt])
+  @@index([importId])
+}
+
+model ImportBatch {
+  id               String       @id @default(cuid())
+  fileName         String
+  fileSize         Int
+  sheetName        String?
+  /// Financial year start (e.g. 2026 = April 2026 .. March 2027)
+  fyStartYear      Int
+  /// Months detected in the file, e.g. ["2026-04","2026-05"]
+  months           Json         @default("[]")
+  status           ImportStatus @default(PROCESSING)
+  totalRows        Int          @default(0)
+  matchedCount     Int          @default(0)
+  updatedCount     Int          @default(0)
+  unchangedCount   Int          @default(0)
+  pvValuesChanged  Int          @default(0)
+  proposerLinked   Int          @default(0)
+  unmappedCount    Int          @default(0)
+  newUnmappedCount Int          @default(0)
+  duplicateCount   Int          @default(0)
+  invalidCount     Int          @default(0)
+  /// [{row, abNumber?, message}]
+  issues           Json         @default("[]")
+  errorMessage     String?
+  startedAt        DateTime     @default(now())
+  finishedAt       DateTime?
+
+  @@index([startedAt])
+}
+
+/// Excel rows whose AB Number does not exist as a Member yet. Removed as soon as
+/// the AB is created (its report data and PV are then moved onto the Member).
+model UnmappedRecord {
+  id               String    @id @default(cuid())
+  abNumber         String    @unique
+  name             String
+  joiningDate      DateTime? @db.Date
+  mobile           String?
+  city             String?
+  district         String?
+  state            String?
+  proposerAbNumber String?
+  proposerName     String?
+  pucHomeDelivery  Boolean?
+  displayWall      Boolean?
+  /// {"2026-04": 1200, "2026-05": 0, ...}
+  monthlyPv        Json      @default("{}")
+  firstImportId    String?
+  lastImportId     String?
+  lastSeenAt       DateTime  @default(now())
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  @@index([proposerAbNumber])
+  @@index([joiningDate])
+}
